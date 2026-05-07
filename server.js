@@ -37,7 +37,7 @@ app.get('/', (_req, res) => res.json({ service: 'Wandr', status: 'ok' }));
 // ── Socket.io ─────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 1e4,
+  maxHttpBufferSize: 5e6, // 5MB — needed for compressed image payloads
   connectTimeout: 10000,
   pingTimeout: 30000,
   pingInterval: 15000,
@@ -158,6 +158,31 @@ io.on('connection', (socket) => {
     });
   });
 
+  // ── Send photo (one-time view) ───────────────────────────────────────────────
+  socket.on('send_photo', (data) => {
+    if (isFlooding(socket.id)) { socket.emit('rate_limited'); return; }
+
+    const roomId = mm.getRoomId(socket.id);
+    if (!roomId) return;
+
+    const { imageData } = data || {};
+    if (typeof imageData !== 'string') return;
+    if (!imageData.startsWith('data:image/')) return;
+    if (imageData.length > 4_500_000) { // ~3.4MB base64 limit
+      socket.emit('error_msg', { message: 'Image too large. Max 3MB.' });
+      return;
+    }
+
+    // Forward ONLY to partner — image is never stored, never logged
+    socket.to(roomId).emit('photo_message', {
+      id: uuidv4(),
+      imageData,
+      ts: Date.now(),
+    });
+
+    socket.emit('photo_sent', { id: uuidv4(), ts: Date.now() });
+  });
+
   // ── Typing indicators ────────────────────────────────────────────────────────
   socket.on('typing',      () => { const r = mm.getRoomId(socket.id); if (r) socket.to(r).emit('partner_typing'); });
   socket.on('stop_typing', () => { const r = mm.getRoomId(socket.id); if (r) socket.to(r).emit('partner_stopped_typing'); });
@@ -197,4 +222,4 @@ setInterval(() => {
 }, 60_000); // every minute (was 5 min)
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log(`Wandr server :${PORT}`));
+server.listen(PORT, () => console.log(`Whisper server :${PORT}`));
