@@ -4,14 +4,19 @@ const queues = { male: [], female: [] };
 const rooms = new Map();        // roomId -> { sockets, createdAt }
 const socketToRoom = new Map(); // socketId -> roomId
 
-const MAX_QUEUE = 1000;
-const SAME_GENDER_WAIT_MS = 60000;
+const MAX_QUEUE       = 1000;
+const SAME_GENDER_WAIT_MS = 30_000; // 30s before falling back to same gender
 
-const addToQueue = (socketId, gender) => {
+const countShared = (a, b) => {
+  if (!a?.length || !b?.length) return 0;
+  return a.filter((i) => b.includes(i)).length;
+};
+
+const addToQueue = (socketId, gender, interests = []) => {
   const q = queues[gender];
   if (q.length >= MAX_QUEUE) return false;
-  if (q.find((x) => x.socketId === socketId)) return true; // already in queue
-  q.push({ socketId, gender, joinedAt: Date.now() });
+  if (q.find((x) => x.socketId === socketId)) return true; // already queued
+  q.push({ socketId, gender, interests, joinedAt: Date.now() });
   return true;
 };
 
@@ -37,37 +42,49 @@ const createRoom = (idA, idB, io) => {
   io.to(idB).emit('matched', { roomId });
 };
 
-const findMatch = (socketId, gender, queuedAt, io) => {
-  // Already matched by someone else while we were waiting — stop searching
-  if (socketToRoom.has(socketId)) return true;
+// Pick the best candidate from a queue based on shared interests.
+// Removes the winner from the queue and returns them (or null if none found).
+const pickBest = (q, socketId, seekerInterests, io) => {
+  let bestIdx   = -1;
+  let bestScore = -1;
+
+  for (let i = 0; i < q.length; i++) {
+    const c = q[i];
+    if (c.socketId === socketId)          continue; // skip self
+    if (!isConnected(c.socketId, io))    continue; // skip dead sockets
+    if (socketToRoom.has(c.socketId))    continue; // skip already matched
+
+    const shared = countShared(seekerInterests, c.interests);
+    // More shared interests = higher score; older queue entries break ties
+    const score  = shared * 100 + (Date.now() - c.joinedAt) / 1000;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestIdx   = i;
+    }
+  }
+
+  if (bestIdx === -1) return null;
+  const [winner] = q.splice(bestIdx, 1);
+  return winner;
+};
+
+const findMatch = (socketId, gender, interests, queuedAt, io) => {
+  if (socketToRoom.has(socketId)) return true; // already matched
 
   const opposite = gender === 'male' ? 'female' : 'male';
-  const sameQ    = queues[gender];
-  const oppQ     = queues[opposite];
+  const waited   = Date.now() - queuedAt;
 
-  // Pull the first still-connected opposite-gender socket
-  const pickFrom = (q) => {
-    while (q.length > 0) {
-      const candidate = q.shift();
-      if (candidate.socketId === socketId) continue;       // skip self
-      if (!isConnected(candidate.socketId, io)) continue; // skip dead sockets
-      if (socketToRoom.has(candidate.socketId)) continue; // skip already matched
-      return candidate;
-    }
-    return null;
-  };
-
-  // Primary: opposite gender
-  const oppMatch = pickFrom(oppQ);
+  // Priority 1: opposite gender — pick the one with most shared interests
+  const oppMatch = pickBest(queues[opposite], socketId, interests, io);
   if (oppMatch) {
     createRoom(socketId, oppMatch.socketId, io);
     return true;
   }
 
-  // Fallback: same gender after long wait
-  const waited = Date.now() - queuedAt > SAME_GENDER_WAIT_MS;
-  if (waited && Math.random() < 0.3) {
-    const sameMatch = pickFrom(sameQ);
+  // Priority 2: same gender — only after 30s wait, no random gating
+  if (waited >= SAME_GENDER_WAIT_MS) {
+    const sameMatch = pickBest(queues[gender], socketId, interests, io);
     if (sameMatch) {
       createRoom(socketId, sameMatch.socketId, io);
       return true;
@@ -90,8 +107,8 @@ const leaveRoom = (socketId, io) => {
   }
 };
 
-const getRoomId   = (socketId) => socketToRoom.get(socketId);
-const isInRoom    = (socketId) => socketToRoom.has(socketId);
+const getRoomId = (socketId) => socketToRoom.get(socketId);
+const isInRoom  = (socketId) => socketToRoom.has(socketId);
 
 const getStats = (onlineCount) => ({
   maleQueue:   queues.male.length,
@@ -102,7 +119,9 @@ const getStats = (onlineCount) => ({
 
 const pruneStaleEntries = (io) => {
   ['male', 'female'].forEach((g) => {
-    queues[g] = queues[g].filter((e) => isConnected(e.socketId, io) && !socketToRoom.has(e.socketId));
+    queues[g] = queues[g].filter(
+      (e) => isConnected(e.socketId, io) && !socketToRoom.has(e.socketId)
+    );
   });
 };
 

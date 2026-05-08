@@ -75,9 +75,10 @@ const reports = [];
 io.on('connection', (socket) => {
   onlineSockets.add(socket.id);
 
-  let userGender   = null;
-  let inQueue      = false;
-  let queuedAt     = null;
+  let userGender    = null;
+  let userInterests = [];
+  let inQueue       = false;
+  let queuedAt      = null;
   let matchInterval = null;
 
   const stopSearching = () => {
@@ -101,6 +102,16 @@ io.on('connection', (socket) => {
       return;
     }
     userGender = data.gender;
+
+    // Validate interests — allow only known strings, max 10
+    const VALID_INTERESTS = [
+      'gaming','music','movies','sports','tech','art',
+      'travel','food','books','anime','fitness','memes',
+    ];
+    userInterests = Array.isArray(data.interests)
+      ? data.interests.filter((i) => VALID_INTERESTS.includes(i)).slice(0, 10)
+      : [];
+
     socket.emit('gender_accepted', { gender: userGender });
   });
 
@@ -119,11 +130,11 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const matched = mm.findMatch(socket.id, userGender, queuedAt, io);
+      const matched = mm.findMatch(socket.id, userGender, userInterests, queuedAt, io);
       if (matched) {
         stopSearching();
       } else {
-        mm.addToQueue(socket.id, userGender);
+        mm.addToQueue(socket.id, userGender, userInterests);
         const stats = mm.getStats(onlineSockets.size);
         socket.emit('queue_update', {
           online:      stats.online,
