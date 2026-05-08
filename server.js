@@ -1,5 +1,5 @@
 /**
- * Wandr — Anonymous Chat Server
+ * Whisper — Anonymous Chat Server
  * Privacy: no chat logs, no IPs stored, no biometric data, ephemeral rooms only.
  */
 
@@ -18,6 +18,7 @@ const server = http.createServer(app);
 
 const CLIENT_URL      = process.env.CLIENT_URL || 'http://localhost:5173';
 const ALLOWED_ORIGINS = [CLIENT_URL, 'http://localhost:4173'];
+const MAX_CONNECTIONS = 5000; // hard cap — reject above this to prevent OOM
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet({ crossOriginEmbedderPolicy: false }));
@@ -27,17 +28,17 @@ app.use(rateLimit({ windowMs: 60_000, max: 60, standardHeaders: true, legacyHead
 app.use(express.json({ limit: '10kb' }));
 
 // ── Track real online count ───────────────────────────────────────────────────
-const onlineSockets = new Set(); // one entry per connected socket
+const onlineSockets = new Set();
 
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', ...mm.getStats(onlineSockets.size) });
 });
-app.get('/', (_req, res) => res.json({ service: 'Wandr', status: 'ok' }));
+app.get('/', (_req, res) => res.json({ service: 'Whisper', status: 'ok' }));
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
 const io = new Server(server, {
   cors: { origin: ALLOWED_ORIGINS, methods: ['GET', 'POST'] },
-  maxHttpBufferSize: 5e6, // 5MB — needed for compressed image payloads
+  maxHttpBufferSize: 5e6,
   connectTimeout: 10000,
   pingTimeout: 30000,
   pingInterval: 15000,
@@ -58,6 +59,11 @@ const isFlooding = (id) => {
 // ── IP connection rate limit ──────────────────────────────────────────────────
 const ipCounts = new Map();
 io.use((socket, next) => {
+  // Hard cap — refuse connections when server is at capacity
+  if (onlineSockets.size >= MAX_CONNECTIONS) {
+    return next(new Error('Server at capacity'));
+  }
+
   const ip  = socket.handshake.address;
   const now = Date.now();
   let e = ipCounts.get(ip) || { count: 0, resetAt: now + 60_000 };
@@ -77,18 +83,11 @@ io.on('connection', (socket) => {
 
   let userGender    = null;
   let userInterests = [];
-  let inQueue       = false;
-  let queuedAt      = null;
-  let matchInterval = null;
 
   const stopSearching = () => {
-    if (matchInterval) { clearInterval(matchInterval); matchInterval = null; }
-    inQueue  = false;
-    queuedAt = null;
     mm.removeFromQueues(socket.id);
   };
 
-  // Broadcast updated online count to everyone
   const broadcastOnline = () => {
     io.emit('online_count', { online: onlineSockets.size });
   };
@@ -103,7 +102,6 @@ io.on('connection', (socket) => {
     }
     userGender = data.gender;
 
-    // Validate interests — allow only known strings, max 10
     const VALID_INTERESTS = [
       'gaming','music','movies','sports','tech','art',
       'travel','food','books','anime','fitness','memes',
@@ -116,36 +114,11 @@ io.on('connection', (socket) => {
   });
 
   // ── Find match ──────────────────────────────────────────────────────────────
+  // No per-socket interval — global loop handles all matching centrally.
   socket.on('find_match', () => {
     if (!userGender) { socket.emit('error_msg', { message: 'Set gender first' }); return; }
-    if (inQueue) return;
-
-    inQueue  = true;
-    queuedAt = Date.now();
-
-    const tryMatch = () => {
-      // Stop if already matched by someone else
-      if (mm.isInRoom(socket.id)) {
-        stopSearching();
-        return;
-      }
-
-      const matched = mm.findMatch(socket.id, userGender, userInterests, queuedAt, io);
-      if (matched) {
-        stopSearching();
-      } else {
-        mm.addToQueue(socket.id, userGender, userInterests);
-        const stats = mm.getStats(onlineSockets.size);
-        socket.emit('queue_update', {
-          online:      stats.online,
-          waitSeconds: Math.round((Date.now() - queuedAt) / 1000),
-        });
-      }
-    };
-
-    // Set interval BEFORE first call so stopSearching() can clear it immediately
-    matchInterval = setInterval(tryMatch, 2500);
-    tryMatch();
+    if (mm.isInQueue(socket.id) || mm.isInRoom(socket.id)) return;
+    mm.addToQueue(socket.id, userGender, userInterests);
   });
 
   // ── Send message ────────────────────────────────────────────────────────────
@@ -160,7 +133,6 @@ io.on('connection', (socket) => {
     text = xss(text.trim()).slice(0, 500);
     if (!text) return;
 
-    // Send ONLY to partner (not back to sender — prevents double messages)
     socket.to(roomId).emit('message', {
       id:   uuidv4(),
       text,
@@ -169,7 +141,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ── Send photo (one-time view) ───────────────────────────────────────────────
+  // ── Send photo (one-time view) ────────────────────────────────────────────
   socket.on('send_photo', (data) => {
     if (isFlooding(socket.id)) { socket.emit('rate_limited'); return; }
 
@@ -179,33 +151,27 @@ io.on('connection', (socket) => {
     const { imageData } = data || {};
     if (typeof imageData !== 'string') return;
     if (!imageData.startsWith('data:image/')) return;
-    if (imageData.length > 4_500_000) { // ~3.4MB base64 limit
+    if (imageData.length > 4_500_000) {
       socket.emit('error_msg', { message: 'Image too large. Max 3MB.' });
       return;
     }
 
-    // Forward ONLY to partner — image is never stored, never logged
-    socket.to(roomId).emit('photo_message', {
-      id: uuidv4(),
-      imageData,
-      ts: Date.now(),
-    });
-
+    socket.to(roomId).emit('photo_message', { id: uuidv4(), imageData, ts: Date.now() });
     socket.emit('photo_sent', { id: uuidv4(), ts: Date.now() });
   });
 
-  // ── Typing indicators ────────────────────────────────────────────────────────
+  // ── Typing indicators ─────────────────────────────────────────────────────
   socket.on('typing',      () => { const r = mm.getRoomId(socket.id); if (r) socket.to(r).emit('partner_typing'); });
   socket.on('stop_typing', () => { const r = mm.getRoomId(socket.id); if (r) socket.to(r).emit('partner_stopped_typing'); });
 
-  // ── Skip ─────────────────────────────────────────────────────────────────────
+  // ── Skip ──────────────────────────────────────────────────────────────────
   socket.on('skip', () => {
     stopSearching();
     mm.leaveRoom(socket.id, io);
     socket.emit('skipped');
   });
 
-  // ── Report ────────────────────────────────────────────────────────────────────
+  // ── Report ────────────────────────────────────────────────────────────────
   socket.on('report', (data) => {
     const valid = ['harassment', 'nudity', 'spam', 'underage', 'other'];
     reports.push({ category: valid.includes(data?.category) ? data.category : 'other', ts: Date.now() });
@@ -214,7 +180,7 @@ io.on('connection', (socket) => {
     socket.emit('skipped');
   });
 
-  // ── Disconnect ────────────────────────────────────────────────────────────────
+  // ── Disconnect ────────────────────────────────────────────────────────────
   socket.on('disconnect', () => {
     onlineSockets.delete(socket.id);
     stopSearching();
@@ -224,13 +190,19 @@ io.on('connection', (socket) => {
   });
 });
 
+// ── Single global matchmaking loop (replaces per-socket intervals) ────────────
+// Processes ALL queued users at once every 2s — O(n) instead of O(n²)
+setInterval(() => {
+  mm.processQueues(io, onlineSockets.size);
+}, 2000);
+
 // ── Periodic cleanup ──────────────────────────────────────────────────────────
 setInterval(() => {
   mm.pruneStaleEntries(io);
   const now = Date.now();
   ipCounts.forEach((e, ip) => { if (now > e.resetAt) ipCounts.delete(ip); });
   msgRates.forEach((e, id) => { if (now > e.resetAt) msgRates.delete(id); });
-}, 60_000); // every minute (was 5 min)
+}, 60_000);
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log(`Whisper server :${PORT}`));
